@@ -428,6 +428,32 @@ func TestManager(t *testing.T) {
 		require.Equal(t, p1.ID(), p2.ID())
 	})
 
+	t.Run("Await reports a duplicate of a finished plan within a sub-poll budget", func(t *testing.T) {
+		mgr := newManager(t, db, twoStageRegistry(t))
+		awaitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		p1, err := mgr.start(ctx, "test.twostage", testInput{Seed: "abc"}, WithIdempotencyKey("dup:2"))
+		require.NoError(t, err)
+		status, err := p1.Await(awaitCtx)
+		require.NoError(t, err)
+		require.Equal(t, StatusSucceeded, status)
+
+		p2, err := mgr.start(ctx, "test.twostage", testInput{Seed: "abc"}, WithIdempotencyKey("dup:2"))
+		require.NoError(t, err)
+		shortCtx, cancel2 := context.WithTimeout(ctx, awaitPollInterval/4)
+		defer cancel2()
+		status, err = p2.Await(shortCtx)
+		require.NoError(t, err)
+		require.Equal(t, StatusSucceeded, status)
+
+		require.Eventually(t, func() bool {
+			mgr.mu.Lock()
+			defer mgr.mu.Unlock()
+			return len(mgr.waiters) == 0
+		}, 2*time.Second, 10*time.Millisecond, "a duplicate start this manager never executes must not leave a waiter behind")
+	})
+
 	t.Run("Await returns Running when the ctx budget expires", func(t *testing.T) {
 		reg := NewRegistry()
 		require.NoError(t, reg.Register(Define(NewWorkflow[testInput]("test.slow"),

@@ -289,8 +289,9 @@ func (m *Manager) startDrain() {
 	m.draining.Store(true)
 }
 
-// runLocal treats a missed claim as a no-op: another executor or the poller
-// owns the run.
+// runLocal treats a missed claim as a no-op: the run is terminal or another
+// executor or the poller owns it. The waiter goes too, since signal may never
+// reach it; await falls back to reading the database.
 func (m *Manager) runLocal(ctx context.Context, runID uuid.UUID) {
 	claimed, ok, err := m.db.ClaimRunByID(ctx, runID)
 	if err != nil {
@@ -299,6 +300,9 @@ func (m *Manager) runLocal(ctx context.Context, runID uuid.UUID) {
 		return
 	}
 	if !ok {
+		m.mu.Lock()
+		delete(m.waiters, runID)
+		m.mu.Unlock()
 		return
 	}
 	m.executePlan(ctx, claimed)
@@ -332,6 +336,16 @@ func (m *Manager) await(ctx context.Context, runID uuid.UUID) (Status, error) {
 		done = c.done
 		// A StartTx run launches here; for a Start run kickOnce makes this a no-op.
 		m.kick(ctx, runID, c)
+	}
+
+	// A duplicate Start hands back a run that may already be terminal, and a
+	// budget shorter than awaitPollInterval would otherwise never read it.
+	run, err := m.db.GetRun(ctx, runID)
+	if err != nil {
+		return awaitPollFailure(ctx, err)
+	}
+	if run.Status != StatusRunning {
+		return run.Status, nil
 	}
 
 	ticker := time.NewTicker(awaitPollInterval)
