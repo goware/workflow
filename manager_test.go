@@ -47,6 +47,13 @@ func newManager(t *testing.T, db *store.Store, reg *Registry, overrides ...func(
 	return mgr
 }
 
+func requireNoWaiters(t *testing.T, mgr *Manager) {
+	t.Helper()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	require.Empty(t, mgr.waiters)
+}
+
 func twoStageRegistry(t *testing.T) *Registry {
 	t.Helper()
 	reg := NewRegistry()
@@ -446,12 +453,90 @@ func TestManager(t *testing.T) {
 		status, err = p2.Await(shortCtx)
 		require.NoError(t, err)
 		require.Equal(t, StatusSucceeded, status)
+		requireNoWaiters(t, mgr)
+	})
 
+	t.Run("Await reports a duplicate of a parked plan within a sub-poll budget", func(t *testing.T) {
+		reg := NewRegistry()
+		require.NoError(t, reg.Register(Define(NewWorkflow[testInput]("test.park"),
+			Handle(NewTask[None]("test.park"), func(context.Context, *TaskRun[testInput]) (None, error) {
+				return None{}, Permanent(errors.New("boom"))
+			}),
+		)))
+		mgr := newManager(t, db, reg)
+		awaitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		p1, err := mgr.start(ctx, "test.park", testInput{Seed: "abc"}, WithIdempotencyKey("dup:3"))
+		require.NoError(t, err)
+		status, err := p1.Await(awaitCtx)
+		require.NoError(t, err)
+		require.Equal(t, StatusStuck, status)
+
+		p2, err := mgr.start(ctx, "test.park", testInput{Seed: "abc"}, WithIdempotencyKey("dup:3"))
+		require.NoError(t, err)
+		shortCtx, cancel2 := context.WithTimeout(ctx, awaitPollInterval/4)
+		defer cancel2()
+		status, err = p2.Await(shortCtx)
+		require.NoError(t, err)
+		require.Equal(t, StatusStuck, status)
+	})
+
+	t.Run("Await leaves no waiter when no local slot runs the plan", func(t *testing.T) {
+		mgr := newManager(t, db, twoStageRegistry(t))
+		for range cap(mgr.sem) {
+			mgr.sem <- struct{}{}
+		}
+		p, err := mgr.start(ctx, "test.twostage", testInput{Seed: "abc"})
+		require.NoError(t, err)
+
+		shortCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		status, err := p.Await(shortCtx)
+		require.NoError(t, err)
+		require.Equal(t, StatusRunning, status)
+		requireNoWaiters(t, mgr)
+	})
+
+	t.Run("concurrent Awaits on one plan all receive the signal", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		reg := NewRegistry()
+		require.NoError(t, reg.Register(Define(NewWorkflow[testInput]("test.gatedfanout"),
+			Handle(NewTask[None]("test.gatedfanout"), func(context.Context, *TaskRun[testInput]) (None, error) {
+				close(started)
+				<-release
+				return None{}, nil
+			}),
+		)))
+		mgr := newManager(t, db, reg)
+		p, err := mgr.start(ctx, "test.gatedfanout", testInput{Seed: "abc"})
+		require.NoError(t, err)
+		<-started
+
+		awaitCtx, cancel := context.WithTimeout(ctx, awaitPollInterval/2)
+		defer cancel()
+		type result struct {
+			status Status
+			err    error
+		}
+		results := make(chan result, 2)
+		for range 2 {
+			go func() {
+				status, err := p.Await(awaitCtx)
+				results <- result{status, err}
+			}()
+		}
 		require.Eventually(t, func() bool {
 			mgr.mu.Lock()
 			defer mgr.mu.Unlock()
-			return len(mgr.waiters) == 0
-		}, 2*time.Second, 10*time.Millisecond, "a duplicate start this manager never executes must not leave a waiter behind")
+			return len(mgr.waiters[p.ID()]) == 2
+		}, time.Second, 5*time.Millisecond)
+		close(release)
+
+		for range 2 {
+			require.Equal(t, result{status: StatusSucceeded}, <-results)
+		}
+		requireNoWaiters(t, mgr)
 	})
 
 	t.Run("Await returns Running when the ctx budget expires", func(t *testing.T) {

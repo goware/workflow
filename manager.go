@@ -40,17 +40,10 @@ type Manager struct {
 	drainMu  sync.RWMutex
 	draining atomic.Bool
 
+	// waiters holds one channel per in-flight Await call, so each entry lives
+	// exactly as long as the Await that added it.
 	mu      sync.Mutex
-	waiters map[uuid.UUID]*completion
-}
-
-// completion signals one in-flight run's terminal status. kickOnce makes
-// concurrent Awaits on a StartTx run launch runLocal at most once.
-type completion struct {
-	done     chan struct{}
-	status   Status
-	once     sync.Once
-	kickOnce sync.Once
+	waiters map[uuid.UUID]map[chan Status]struct{}
 }
 
 // NewManager freezes reg and returns a Manager over db. It fails unless the
@@ -85,7 +78,7 @@ func NewManager(ctx context.Context, db *pgkit.DB, reg *Registry, cfg Config, lo
 		cfg:           cfg,
 		log:           log,
 		sem:           make(chan struct{}, cfg.MaxLocalRuns),
-		waiters:       make(map[uuid.UUID]*completion),
+		waiters:       make(map[uuid.UUID]map[chan Status]struct{}),
 	}, nil
 }
 
@@ -157,9 +150,9 @@ func (m *Manager) start(ctx context.Context, workflowName string, input any, opt
 		return nil, fmt.Errorf("workflow: insert run %q: %w", workflowName, err)
 	}
 
-	c := m.register(runID)
-	m.kick(ctx, runID, c)
-	return &WorkflowRun{id: runID, mgr: m}, nil
+	r := &WorkflowRun{id: runID, mgr: m}
+	r.kick(ctx)
+	return r, nil
 }
 
 func (m *Manager) startTx(ctx context.Context, tx pgx.Tx, workflowName string, input any, opts ...StartOption) (*WorkflowRun, error) {
@@ -182,7 +175,6 @@ func (m *Manager) startTx(ctx context.Context, tx pgx.Tx, workflowName string, i
 		runID = id
 	}
 
-	m.register(runID)
 	return &WorkflowRun{id: runID, mgr: m}, nil
 }
 
@@ -238,23 +230,6 @@ func (m *Manager) buildRun(ctx context.Context, workflowName string, input any, 
 	return run, tasks, nil
 }
 
-func (m *Manager) register(runID uuid.UUID) *completion {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if c, ok := m.waiters[runID]; ok {
-		return c
-	}
-	c := &completion{done: make(chan struct{})}
-	m.waiters[runID] = c
-	return c
-}
-
-// kick is shared by Start and a StartTx run's first Await, so a run launches
-// once whichever fires first.
-func (m *Manager) kick(ctx context.Context, runID uuid.UUID, c *completion) {
-	c.kickOnce.Do(func() { m.launch(ctx, runID) })
-}
-
 // launch skips when the semaphore is full or a drain has started; the poller
 // covers the run either way. It holds drainMu's read lock from the draining
 // check through wg.Go, so a launch is either registered with the WaitGroup
@@ -289,9 +264,8 @@ func (m *Manager) startDrain() {
 	m.draining.Store(true)
 }
 
-// runLocal treats a missed claim as a no-op: the run is terminal or another
-// executor or the poller owns it. The waiter goes too, since signal may never
-// reach it; await falls back to reading the database.
+// runLocal treats a missed claim as a no-op: another executor or the poller
+// owns the run.
 func (m *Manager) runLocal(ctx context.Context, runID uuid.UUID) {
 	claimed, ok, err := m.db.ClaimRunByID(ctx, runID)
 	if err != nil {
@@ -300,43 +274,48 @@ func (m *Manager) runLocal(ctx context.Context, runID uuid.UUID) {
 		return
 	}
 	if !ok {
-		m.mu.Lock()
-		delete(m.waiters, runID)
-		m.mu.Unlock()
 		return
 	}
 	m.executePlan(ctx, claimed)
 }
 
-func (m *Manager) signal(runID uuid.UUID, s Status) {
+func (m *Manager) subscribe(runID uuid.UUID) chan Status {
+	done := make(chan Status, 1)
 	m.mu.Lock()
-	c, ok := m.waiters[runID]
-	if ok {
+	defer m.mu.Unlock()
+	if m.waiters[runID] == nil {
+		m.waiters[runID] = make(map[chan Status]struct{})
+	}
+	m.waiters[runID][done] = struct{}{}
+	return done
+}
+
+func (m *Manager) unsubscribe(runID uuid.UUID, done chan Status) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.waiters[runID], done)
+	if len(m.waiters[runID]) == 0 {
 		delete(m.waiters, runID)
 	}
+}
+
+// signal runs after the terminal status is persisted, so an Await that
+// subscribes too late to receive it reads the status instead.
+func (m *Manager) signal(runID uuid.UUID, s Status) {
+	m.mu.Lock()
+	subs := m.waiters[runID]
+	delete(m.waiters, runID)
 	m.mu.Unlock()
-	if !ok {
-		return
+	for done := range subs {
+		done <- s
 	}
-	c.once.Do(func() {
-		c.status = s
-		close(c.done)
-	})
 }
 
 // await returns StatusRunning when ctx expires before the run is terminal;
 // the run keeps going in the background.
 func (m *Manager) await(ctx context.Context, runID uuid.UUID) (Status, error) {
-	m.mu.Lock()
-	c := m.waiters[runID]
-	m.mu.Unlock()
-
-	var done <-chan struct{}
-	if c != nil {
-		done = c.done
-		// A StartTx run launches here; for a Start run kickOnce makes this a no-op.
-		m.kick(ctx, runID, c)
-	}
+	done := m.subscribe(runID)
+	defer m.unsubscribe(runID, done)
 
 	// A duplicate Start hands back a run that may already be terminal, and a
 	// budget shorter than awaitPollInterval would otherwise never read it.
@@ -353,8 +332,8 @@ func (m *Manager) await(ctx context.Context, runID uuid.UUID) (Status, error) {
 
 	for {
 		select {
-		case <-done:
-			return c.status, nil
+		case s := <-done:
+			return s, nil
 		case <-ticker.C:
 			run, err := m.db.GetRun(ctx, runID)
 			if err != nil {
