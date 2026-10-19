@@ -138,19 +138,19 @@ func (m *Manager) start(ctx context.Context, workflowName string, input any, opt
 		return nil, err
 	}
 
-	runID := run.ID
+	runID, inserted := run.ID, true
 	if err := pgx.BeginFunc(ctx, m.db.DB.Conn, func(tx pgx.Tx) error {
 		if cfg.idempotencyKey == "" {
 			return m.db.WithTx(tx).InsertRun(ctx, run, tasks)
 		}
-		id, _, err := m.db.WithTx(tx).UpsertRun(ctx, run, tasks)
-		runID = id
+		id, ok, err := m.db.WithTx(tx).UpsertRun(ctx, run, tasks)
+		runID, inserted = id, ok
 		return err
 	}); err != nil {
 		return nil, fmt.Errorf("workflow: insert run %q: %w", workflowName, err)
 	}
 
-	r := &WorkflowRun{id: runID, mgr: m}
+	r := &WorkflowRun{id: runID, mgr: m, inserted: inserted}
 	r.kick(ctx)
 	return r, nil
 }
@@ -162,20 +162,20 @@ func (m *Manager) startTx(ctx context.Context, tx pgx.Tx, workflowName string, i
 		return nil, err
 	}
 
-	runID := run.ID
+	runID, inserted := run.ID, true
 	if cfg.idempotencyKey == "" {
 		if err := m.db.WithTx(tx).InsertRun(ctx, run, tasks); err != nil {
 			return nil, fmt.Errorf("workflow: insert run %q: %w", workflowName, err)
 		}
 	} else {
-		id, _, err := m.db.WithTx(tx).UpsertRun(ctx, run, tasks)
+		id, ok, err := m.db.WithTx(tx).UpsertRun(ctx, run, tasks)
 		if err != nil {
 			return nil, fmt.Errorf("workflow: insert run %q: %w", workflowName, err)
 		}
-		runID = id
+		runID, inserted = id, ok
 	}
 
-	return &WorkflowRun{id: runID, mgr: m}, nil
+	return &WorkflowRun{id: runID, mgr: m, inserted: inserted}, nil
 }
 
 func (m *Manager) buildRun(ctx context.Context, workflowName string, input any, idempotencyKey string) (*store.WorkflowRun, []*store.TaskRun, error) {

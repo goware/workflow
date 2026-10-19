@@ -87,9 +87,10 @@ const (
 
 // WorkflowRun is a handle to one started workflow run.
 type WorkflowRun struct {
-	id     uuid.UUID
-	mgr    *Manager
-	kicked sync.Once
+	id       uuid.UUID
+	mgr      *Manager
+	inserted bool
+	kicked   sync.Once
 }
 
 // ID returns the run's identifier.
@@ -105,8 +106,13 @@ func (r *WorkflowRun) Await(ctx context.Context) (Status, error) {
 }
 
 // kick launches the run in-process at most once per handle: from Start, or
-// from a StartTx handle's first Await, once the caller has committed.
+// from a StartTx handle's first Await, once the caller has committed. A
+// duplicate's handle never launches: the run belongs to the start that
+// inserted it, or to the poller.
 func (r *WorkflowRun) kick(ctx context.Context) {
+	if !r.inserted {
+		return
+	}
 	r.kicked.Do(func() { r.mgr.launch(ctx, r.id) })
 }
 

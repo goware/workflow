@@ -482,6 +482,78 @@ func TestManager(t *testing.T) {
 		require.Equal(t, StatusStuck, status)
 	})
 
+	t.Run("concurrent duplicate starts never launch the plan", func(t *testing.T) {
+		mgr := newManager(t, db, twoStageRegistry(t))
+		awaitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		p1, err := mgr.start(ctx, "test.twostage", testInput{Seed: "abc"}, WithIdempotencyKey("dup:4"))
+		require.NoError(t, err)
+		status, err := p1.Await(awaitCtx)
+		require.NoError(t, err)
+		require.Equal(t, StatusSucceeded, status)
+
+		// launch blocks on drainMu's read lock, so a duplicate that launches
+		// never returns while the test holds the write lock.
+		mgr.drainMu.Lock()
+		var wg sync.WaitGroup
+		errs := make(chan error, 9)
+		awaitDup := func(p *WorkflowRun) error {
+			if p.ID() != p1.ID() {
+				return fmt.Errorf("duplicate resolved to %s, want %s", p.ID(), p1.ID())
+			}
+			status, err := p.Await(awaitCtx)
+			if err != nil {
+				return err
+			}
+			if status != StatusSucceeded {
+				return fmt.Errorf("duplicate awaited %v, want %v", status, StatusSucceeded)
+			}
+			return nil
+		}
+		for range 8 {
+			wg.Go(func() {
+				p, err := mgr.start(ctx, "test.twostage", testInput{Seed: "abc"}, WithIdempotencyKey("dup:4"))
+				if err != nil {
+					errs <- err
+					return
+				}
+				errs <- awaitDup(p)
+			})
+		}
+		wg.Go(func() {
+			var p *WorkflowRun
+			err := pgx.BeginFunc(ctx, db.DB.Conn, func(tx pgx.Tx) error {
+				var err error
+				p, err = mgr.startTx(ctx, tx, "test.twostage", testInput{Seed: "abc"}, WithIdempotencyKey("dup:4"))
+				return err
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			errs <- awaitDup(p)
+		})
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		var blocked bool
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			blocked = true
+		}
+		mgr.drainMu.Unlock()
+		<-done
+		require.False(t, blocked, "a duplicate start launched the plan")
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+	})
+
 	t.Run("Await leaves no waiter when no local slot runs the plan", func(t *testing.T) {
 		mgr := newManager(t, db, twoStageRegistry(t))
 		for range cap(mgr.sem) {
