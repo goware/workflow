@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -86,8 +87,10 @@ const (
 
 // WorkflowRun is a handle to one started workflow run.
 type WorkflowRun struct {
-	id  uuid.UUID
-	mgr *Manager
+	id       uuid.UUID
+	mgr      *Manager
+	inserted bool
+	kicked   sync.Once
 }
 
 // ID returns the run's identifier.
@@ -98,7 +101,19 @@ func (r *WorkflowRun) ID() uuid.UUID {
 // Await blocks until the run is terminal, or returns StatusRunning when ctx
 // expires first while the run keeps going in the background.
 func (r *WorkflowRun) Await(ctx context.Context) (Status, error) {
+	r.kick(ctx)
 	return r.mgr.await(ctx, r.id)
+}
+
+// kick launches the run in-process at most once per handle: from Start, or
+// from a StartTx handle's first Await, once the caller has committed. A
+// duplicate's handle never launches: the run belongs to the start that
+// inserted it, or to the poller.
+func (r *WorkflowRun) kick(ctx context.Context) {
+	if !r.inserted {
+		return
+	}
+	r.kicked.Do(func() { r.mgr.launch(ctx, r.id) })
 }
 
 // Status returns the run's persisted lifecycle state.
