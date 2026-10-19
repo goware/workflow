@@ -205,6 +205,10 @@ func (m *Manager) executePlan(ctx context.Context, claimed *store.ClaimedRun) St
 			return StatusStuck
 		}
 
+		taskLog.WarnContext(ctx, "workflow: task attempt failed",
+			slog.Int("attempt", attempt), slog.Int("budget", budget),
+			slog.Duration("backoff", backoff), slog.Any("error", err))
+
 		if backoff <= m.cfg.MaxInProcessBackoff {
 			persisted, perr := m.db.PersistTaskFailure(ctx, runID, seq, failure, backoff, false, claimID)
 			if perr != nil {

@@ -177,6 +177,16 @@ func (h *recordingHandler) messages() []string {
 	return slices.Clone(h.msgs)
 }
 
+func countMessage(h *recordingHandler, msg string) int {
+	n := 0
+	for _, m := range h.messages() {
+		if m == msg {
+			n++
+		}
+	}
+	return n
+}
+
 func TestNextBackoff(t *testing.T) {
 	cfg := Config{BackoffBase: time.Second, BackoffMax: time.Minute}
 	schedule := []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}
@@ -673,11 +683,14 @@ func TestExecutor(t *testing.T) {
 				return map[string]string{"v": "ok"}, nil
 			}, Backoff(10*time.Millisecond, 50*time.Millisecond), MaxAttempts(5)),
 		)))
-		mgr := newManager(t, db, reg, func(c *Config) { c.MaxInProcessBackoff = time.Second })
+		rec := new(recordingHandler)
+		mgr, err := NewManager(t.Context(), db.DB, reg, Config{MaxInProcessBackoff: time.Second}, slog.New(rec))
+		require.NoError(t, err)
 
 		plan := seedPlan(t, db, ctx, mgr, "test.retry", testInput{Seed: "x"})
 		require.Equal(t, StatusSucceeded, mgr.executePlan(ctx, claim(t, db, ctx, plan.ID)))
 		require.EqualValues(t, 3, calls.Load())
+		require.Equal(t, 2, countMessage(rec, "workflow: task attempt failed"))
 
 		got, err := db.GetRun(ctx, plan.ID)
 		require.NoError(t, err)
@@ -695,11 +708,14 @@ func TestExecutor(t *testing.T) {
 				return nil, errors.New("transient")
 			}, Backoff(20*time.Second, time.Minute), MaxAttempts(5)),
 		)))
-		mgr := newManager(t, db, reg)
+		rec := new(recordingHandler)
+		mgr, err := NewManager(t.Context(), db.DB, reg, Config{}, slog.New(rec))
+		require.NoError(t, err)
 
 		plan := seedPlan(t, db, ctx, mgr, "test.longbackoff", testInput{Seed: "x"})
 		before := time.Now()
 		require.Equal(t, StatusRunning, mgr.executePlan(ctx, claim(t, db, ctx, plan.ID)))
+		require.Equal(t, 1, countMessage(rec, "workflow: task attempt failed"))
 
 		got, err := db.GetRun(ctx, plan.ID)
 		require.NoError(t, err)
